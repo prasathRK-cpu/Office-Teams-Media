@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && getUserData().role == 'admin';
+    }
+
+    function isModerator() {
+      return isSignedIn() && (getUserData().role == 'moderator' || getUserData().role == 'admin');
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // --- Routes ---
+
+    // Allow the test connection path used by the SDK check
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // USERS
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.uid == request.auth.uid &&
+               data.email is string &&
+               data.displayName is string && data.displayName.size() <= 100 &&
+               data.createdAt == request.time;
+      }
+
+      // Explicitly allow a user to read their own profile, even if role lookup fails
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      
+      allow create: if isSignedIn() && isOwner(userId) && 
+                    incoming().role == 'user' && 
+                    isValidUser(incoming()) && 
+                    incoming().keys().hasAll(['uid', 'email', 'displayName', 'role', 'createdAt']) && 
+                    incoming().keys().size() == 5;
+      
+      allow update: if isSignedIn() && (
+        (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL']) && incoming().displayName is string) ||
+        (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['role']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // POSTS
+    match /posts/{postId} {
+      function isValidPost(data) {
+        return data.authorId is string && data.authorId == request.auth.uid &&
+               data.title is string && data.title.size() > 0 && data.title.size() <= 200 &&
+               data.content is string && data.content.size() > 0 && data.content.size() <= 10000 &&
+               data.category in ['news', 'daily', 'general'];
+      }
+
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(postId) && isValidPost(incoming());
+      allow update: if isSignedIn() && (
+        (isOwner(existing().authorId) && isValidPost(incoming())) ||
+        isModerator() // Moderators can edit any post
+      );
+      allow delete: if isSignedIn() && (isOwner(existing().authorId) || isModerator());
+    }
+
+    // COMMENTS
+    match /posts/{postId}/comments/{commentId} {
+      function isValidComment(data) {
+        return data.authorId is string && data.authorId == request.auth.uid &&
+               data.content is string && data.content.size() > 0 && data.content.size() <= 1000;
+      }
+
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidComment(incoming());
+      allow update: if isSignedIn() && (
+        (isOwner(existing().authorId) && isValidComment(incoming())) ||
+        isModerator()
+      );
+      allow delete: if isSignedIn() && (isOwner(existing().authorId) || isModerator());
+    }
+
+    // REPORTS
+    match /reports/{reportId} {
+      allow create: if isSignedIn() && 
+                    incoming().reporterId == request.auth.uid &&
+                    incoming().status == 'pending';
+      allow read, update, delete: if isAdmin();
+    }
+  }
+}
